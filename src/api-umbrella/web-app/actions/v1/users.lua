@@ -13,21 +13,26 @@ local deep_merge_overwrite_arrays = require "api-umbrella.utils.deep_merge_overw
 local deepcopy = require("pl.tablex").deepcopy
 local escape_html = require("lapis.html").escape
 local flatten_headers = require "api-umbrella.utils.flatten_headers"
+local http = require "resty.http"
 local is_array = require "api-umbrella.utils.is_array"
 local is_email = require "api-umbrella.utils.is_email"
 local is_empty = require "api-umbrella.utils.is_empty"
 local is_hash = require "api-umbrella.utils.is_hash"
+local json_decode = require("cjson.safe").decode
+local json_encode = require "api-umbrella.utils.json_encode"
 local json_response = require "api-umbrella.web-app.utils.json_response"
 local known_domains = require "api-umbrella.web-app.utils.known_domains"
 local parse_post_for_pseudo_ie_cors = require "api-umbrella.web-app.utils.parse_post_for_pseudo_ie_cors"
 local require_admin = require "api-umbrella.web-app.utils.require_admin"
 local respond_to = require "api-umbrella.web-app.utils.respond_to"
 local startswith = require("pl.stringx").startswith
+local t = require("api-umbrella.web-app.utils.gettext").gettext
 local validation_ext = require "api-umbrella.web-app.utils.validation_ext"
 local wrapped_json_params = require "api-umbrella.web-app.utils.wrapped_json_params"
 
 local db_null = db.NULL
 local gsub = ngx.re.gsub
+local re_find = ngx.re.find
 
 local _M = {}
 
@@ -120,6 +125,116 @@ local function send_welcome_email(api_user, options)
   end
 end
 
+local function verify_recaptcha(secret, response)
+  local httpc = http.new()
+
+  if config["http_proxy"] or config["https_proxy"] then
+    httpc:set_proxy_options({
+      http_proxy = config["http_proxy"],
+      https_proxy = config["https_proxy"],
+    })
+  end
+
+  local connect_ok, connect_err = httpc:connect({
+    scheme = config["web"]["recaptcha_scheme"],
+    host = config["web"]["recaptcha_host"],
+    port = config["web"]["recaptcha_port"],
+    ssl_server_name = config["web"]["recaptcha_host"],
+    ssl_verify = true,
+  })
+  if not connect_ok then
+    httpc:close()
+    return nil, "recaptcha connect error: " .. (connect_err or "")
+  end
+
+  local res, err = httpc:request({
+    method = "POST",
+    path = "/recaptcha/api/siteverify",
+    headers = {
+      ["Content-Type"] = "application/x-www-form-urlencoded",
+    },
+    body = ngx.encode_args({
+      secret = secret,
+      response = response,
+      remoteip = ngx.var.remote_addr,
+    })
+  })
+  if err then
+    httpc:close()
+    return nil, "recaptcha request error: " .. (err or "")
+  end
+
+  local body, body_err = res:read_body()
+  if body_err then
+    httpc:close()
+    return nil, "recaptcha read body error: " .. (body_err or "")
+  end
+
+  local keepalive_ok, keepalive_err = httpc:set_keepalive()
+  if not keepalive_ok then
+    httpc:close()
+    return nil, "recaptcha keepalive error: " .. (keepalive_err or "")
+  end
+
+  if res.status ~= 200 then
+    return nil, "Unsuccessful response: " .. (body or "")
+  end
+
+  local data, json_err = json_decode(body)
+  if json_err then
+    return nil, "recaptcha json error: " .. (json_err or "")
+  end
+
+  return data
+end
+
+local function recaptcha_required_for_origin(required_origin_regex, request_origin)
+  if not required_origin_regex then
+    return true
+  end
+
+  local find_from, _, find_err = re_find(request_origin or "", required_origin_regex, "ijo")
+  if find_err then
+    ngx.log(ngx.ERR, "regex error: ", find_err)
+    return false
+  end
+
+  if find_from then
+    return true
+  else
+    return false
+  end
+end
+
+local function recaptcha_passes(self, user_params)
+  -- Admins don't need captcha.
+  if self.current_admin then
+    return true
+  end
+
+  if config["web"]["recaptcha_v2_required"] and recaptcha_required_for_origin(config["web"]["recaptcha_v2_required_origin_regex"], user_params["registration_origin"]) then
+    if not user_params["registration_recaptcha_v2_success"] then
+      return false, "reCAPTCHA v2 not successful"
+    elseif not known_domains.is_allowed_domain(user_params["registration_recaptcha_v2_hostname"]) then
+      return false, "reCAPTCHA v2 disallowed domain: " .. (user_params["registration_recaptcha_v2_hostname"] or "")
+    end
+  end
+
+  if config["web"]["recaptcha_v3_required"] and recaptcha_required_for_origin(config["web"]["recaptcha_v3_required_origin_regex"], user_params["registration_origin"]) then
+    if not user_params["registration_recaptcha_v3_success"] then
+      return false, "reCAPTCHA v3 not successful"
+    elseif not known_domains.is_allowed_domain(user_params["registration_recaptcha_v3_hostname"]) then
+      return false, "reCAPTCHA v3 disallowed domain: " .. (user_params["registration_recaptcha_v3_hostname"] or "")
+    elseif not user_params["registration_recaptcha_v3_score"] then
+      return false, "reCAPTCHA v3 missing score"
+    elseif user_params["registration_recaptcha_v3_score"] < config["web"]["recaptcha_v3_required_score"] then
+      return false, "reCAPTCHA v3 below required score: " .. (user_params["registration_recaptcha_v3_score"] or "")
+    end
+  end
+
+  return true
+end
+
 function _M.index(self)
   return datatables.index(self, ApiUser, {
     where = {
@@ -183,6 +298,13 @@ function _M.create(self)
   else
     user_params["registration_source"] = "api"
   end
+  user_params["registration_key_creator_api_user_id"] = request_headers["x-api-user-id"]
+  if not is_empty(options) then
+    user_params["registration_options"] = options
+  end
+  if not is_empty(self.params["options"]) then
+    user_params["registration_input_options"] = self.params["options"]
+  end
 
   -- If email verification is enabled, then create the record and mark its
   -- email_verified field as true. Since the API key won't be part of the API
@@ -193,6 +315,67 @@ function _M.create(self)
     user_params["email_verified"] = true
   else
     user_params["email_verified"] = false
+  end
+
+  if config["web"]["recaptcha_v2_secret_key"] and self.params["g-recaptcha-response-v2"] then
+    local result, recaptcha_err = verify_recaptcha(config["web"]["recaptcha_v2_secret_key"], self.params["g-recaptcha-response-v2"])
+    if result and not recaptcha_err then
+      if not known_domains.is_allowed_domain(result["hostname"]) then
+        ngx.log(ngx.WARN, "reCAPTCHA v2 disallowed domain: ", result["hostname"])
+      end
+
+      user_params["registration_recaptcha_v2_success"] = result["success"]
+      user_params["registration_recaptcha_v2_hostname"] = result["hostname"]
+      user_params["registration_recaptcha_v2_error_codes"] = result["error-codes"]
+    elseif recaptcha_err then
+      ngx.log(ngx.ERR, "reCAPTCHA v2 error: ", recaptcha_err)
+    end
+  end
+
+  if config["web"]["recaptcha_v3_secret_key"] and self.params["g-recaptcha-response-v3"] then
+    local result, recaptcha_err = verify_recaptcha(config["web"]["recaptcha_v3_secret_key"], self.params["g-recaptcha-response-v3"])
+    if result and not recaptcha_err then
+      if not known_domains.is_allowed_domain(result["hostname"]) then
+        ngx.log(ngx.WARN, "reCAPTCHA v3 disallowed domain: ", result["hostname"])
+      end
+
+      user_params["registration_recaptcha_v3_success"] = result["success"]
+      user_params["registration_recaptcha_v3_hostname"] = result["hostname"]
+      user_params["registration_recaptcha_v3_score"] = result["score"]
+      user_params["registration_recaptcha_v3_action"] = result["action"]
+      user_params["registration_recaptcha_v3_error_codes"] = result["error-codes"]
+    elseif recaptcha_err then
+      ngx.log(ngx.ERR, "reCAPTCHA v2 error: ", recaptcha_err)
+    end
+  end
+
+  local recaptcha_ok, recaptcha_err = recaptcha_passes(self, user_params)
+  if not recaptcha_ok then
+    ngx.log(ngx.WARN, "reCAPTCHA failed: ", (recaptcha_err or "") .. "; " .. json_encode(user_params) .. "; " .. json_encode(request_headers))
+    return coroutine.yield("error", {
+      _render = {
+        errors = {
+          {
+            code = "UNEXPECTED_ERROR",
+            message = t("CAPTCHA verification failed. Please try again or contact us for assistance."),
+          },
+        },
+      },
+    })
+  end
+
+  if not self.current_admin and request_headers["referer"] and (not request_headers["user-agent"] or not request_headers["origin"]) then
+    ngx.log(ngx.WARN, "Missing `User-Agent` or `Origin`: " .. json_encode(request_headers) .. "; " .. json_encode(user_params))
+    return coroutine.yield("error", {
+      _render = {
+        errors = {
+          {
+            code = "UNEXPECTED_ERROR",
+            message = t("An unexpected error occurred during signup. Please try again or contact us for assistance."),
+          },
+        },
+      },
+    })
   end
 
   local api_user = assert(ApiUser:authorized_create(user_params))

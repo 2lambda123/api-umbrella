@@ -11,10 +11,12 @@ local hmac = require "api-umbrella.utils.hmac"
 local is_array = require "api-umbrella.utils.is_array"
 local is_hash = require "api-umbrella.utils.is_hash"
 local json_array_fields = require "api-umbrella.web-app.utils.json_array_fields"
+local json_encode = require "api-umbrella.utils.json_encode"
 local json_null_default = require "api-umbrella.web-app.utils.json_null_default"
 local lyaml = require "lyaml"
 local model_ext = require "api-umbrella.web-app.utils.model_ext"
 local nillify_yaml_nulls = require "api-umbrella.utils.nillify_yaml_nulls"
+local pg_encode_array = require "api-umbrella.utils.pg_encode_array"
 local pg_encode_json = require("pgmoon.json").encode_json
 local pretty_yaml_dump = require "api-umbrella.web-app.utils.pretty_yaml_dump"
 local random_token = require "api-umbrella.utils.random_token"
@@ -169,6 +171,7 @@ ApiUser = model_ext.new_class("api_users", {
       data["registration_origin"] = json_null_default(self.registration_origin)
       data["registration_referer"] = json_null_default(self.registration_referer)
       data["registration_user_agent"] = json_null_default(self.registration_user_agent)
+      data["registration_key_creator_api_user_id"] = json_null_default(self.registration_key_creator_api_user_id)
       data["metadata"] = json_null_default(self.metadata)
       data["metadata_yaml_string"] = json_null_default(self:metadata_yaml_string())
 
@@ -332,6 +335,35 @@ ApiUser = model_ext.new_class("api_users", {
     validate_field(errors, data, "registration_origin", t("Registration origin"), {
       { validation_ext.db_null_optional.string:maxlen(1000), string.format(t("is too long (maximum is %d characters)"), 1000) },
     })
+    validate_field(errors, data, "registration_recaptcha_v2_success", t("CAPTCHA success"), {
+      { validation_ext.db_null_optional.boolean, t("is not a boolean") },
+    })
+    validate_field(errors, data, "registration_recaptcha_v2_hostname", t("CAPTCHA hostname"), {
+      { validation_ext.db_null_optional.string:maxlen(255), string.format(t("is too long (maximum is %d characters)"), 255) },
+    })
+    validate_field(errors, data, "registration_recaptcha_v2_error_codes", t("CAPTCHA error codes"), {
+      { validation_ext.db_null_optional.array_table, t("is not an array") },
+      { validation_ext.db_null_optional.array_strings, t("must be an array of strings") },
+      { validation_ext.db_null_optional:array_strings_maxlen(50), string.format(t("is too long (maximum is %d characters)"), 50) },
+    })
+    validate_field(errors, data, "registration_recaptcha_v3_success", t("CAPTCHA success"), {
+      { validation_ext.db_null_optional.boolean, t("is not a boolean") },
+    })
+    validate_field(errors, data, "registration_recaptcha_v3_hostname", t("CAPTCHA hostname"), {
+      { validation_ext.db_null_optional.string:maxlen(255), string.format(t("is too long (maximum is %d characters)"), 255) },
+    })
+    validate_field(errors, data, "registration_recaptcha_v3_score", t("CAPTCHA score"), {
+      { validation_ext.db_null_optional.number, t("is not a number") },
+    })
+    validate_field(errors, data, "registration_recaptcha_v3_action", t("CAPTCHA action"), {
+      { validation_ext.db_null_optional.string:maxlen(255), string.format(t("is too long (maximum is %d characters)"), 255) },
+    })
+    validate_field(errors, data, "registration_recaptcha_v3_error_codes", t("CAPTCHA error codes"), {
+      { validation_ext.db_null_optional.array_table, t("is not an array") },
+      { validation_ext.db_null_optional.array_strings, t("must be an array of strings") },
+      { validation_ext.db_null_optional:array_strings_maxlen(50), string.format(t("is too long (maximum is %d characters)"), 50) },
+    })
+
     if not self or not self.id then
       validate_field(errors, data, "terms_and_conditions", t("Terms and conditions"), {
         { validation_ext.boolean:equals(true), t("Check the box to agree to the terms and conditions.") },
@@ -350,12 +382,44 @@ ApiUser = model_ext.new_class("api_users", {
       model_ext.add_error(errors, "metadata_yaml_string", t("Metadata"), data["_metadata_yaml_string_parse_error"])
     end
 
+    if data["registration_options"] and not is_hash(data["registration_options"]) and data["registration_options"] ~= db_null then
+      model_ext.add_error(errors, "registration_options", t("Registration options"), t("unexpected type (must be a hash)"))
+    end
+
+    if data["registration_options"] and is_hash(data["registration_options"]) and data["registration_options"] ~= db_null and string.len(json_encode(data["registration_options"])) > 4000 then
+      model_ext.add_error(errors, "registration_options", t("Registration options"), t("is too long"))
+    end
+
+    if data["registration_input_options"] and not is_hash(data["registration_input_options"]) and data["registration_input_options"] ~= db_null then
+      model_ext.add_error(errors, "registration_input_options", t("Registration input options"), t("unexpected type (must be a hash)"))
+    end
+
+    if data["registration_input_options"] and is_hash(data["registration_input_options"]) and data["registration_input_options"] ~= db_null and string.len(json_encode(data["registration_input_options"])) > 4000 then
+      model_ext.add_error(errors, "registration_input_options", t("Registration input options"), t("is too long"))
+    end
+
     return errors
   end,
 
   before_save = function(_, values)
     if is_hash(values["metadata"]) and values["metadata"] ~= db_null then
       values["metadata"] = db_raw(pg_encode_json(values["metadata"]))
+    end
+
+    if is_array(values["registration_recaptcha_v2_error_codes"]) and values["registration_recaptcha_v2_error_codes"] ~= db_null then
+      values["registration_recaptcha_v2_error_codes"] = db_raw(pg_encode_array(values["registration_recaptcha_v2_error_codes"]))
+    end
+
+    if is_array(values["registration_recaptcha_v3_error_codes"]) and values["registration_recaptcha_v3_error_codes"] ~= db_null then
+      values["registration_recaptcha_v3_error_codes"] = db_raw(pg_encode_array(values["registration_recaptcha_v3_error_codes"]))
+    end
+
+    if is_hash(values["registration_options"]) and values["registration_options"] ~= db_null then
+      values["registration_options"] = db_raw(pg_encode_json(values["registration_options"]))
+    end
+
+    if is_hash(values["registration_input_options"]) and values["registration_input_options"] ~= db_null then
+      values["registration_input_options"] = db_raw(pg_encode_json(values["registration_input_options"]))
     end
   end,
 

@@ -1469,4 +1469,39 @@ return {
     db.query(grants_sql)
     db.query("COMMIT")
   end,
+
+  [1700281762] = function()
+    db.query("BEGIN")
+
+    db.query("ALTER TABLE api_users ADD COLUMN registration_key_creator_api_user_id uuid REFERENCES api_users (id) ON DELETE RESTRICT")
+    db.query("ALTER TABLE api_users ADD COLUMN registration_recaptcha_v2_success boolean")
+    db.query("ALTER TABLE api_users ADD COLUMN registration_recaptcha_v2_error_codes varchar(50)[]")
+    db.query("ALTER TABLE api_users ADD COLUMN registration_recaptcha_v3_success boolean")
+    db.query("ALTER TABLE api_users ADD COLUMN registration_recaptcha_v3_score numeric(2, 1)")
+    db.query("ALTER TABLE api_users ADD COLUMN registration_recaptcha_v3_action varchar(255)")
+    db.query("ALTER TABLE api_users ADD COLUMN registration_recaptcha_v3_error_codes varchar(50)[]")
+
+    db.query(grants_sql)
+    db.query("COMMIT")
+  end,
+
+  [1700346585] = function()
+    db.query("BEGIN")
+
+    db.query("ALTER TABLE api_users ADD COLUMN registration_recaptcha_v2_hostname varchar(255)")
+    db.query("ALTER TABLE api_users ADD COLUMN registration_recaptcha_v3_hostname varchar(255)")
+
+    db.query(grants_sql)
+    db.query("COMMIT")
+  end,
+
+  [1701483732] = function()
+    db.query("BEGIN")
+
+    db.query("ALTER TABLE api_users ADD COLUMN registration_options jsonb")
+    db.query("ALTER TABLE api_users ADD COLUMN registration_input_options jsonb")
+
+    db.query(grants_sql)
+    db.query("COMMIT")
+  end,
 }
